@@ -83,6 +83,123 @@ export async function listFiles(path = '/'): Promise<FileItem[]> {
   return data.files || []
 }
 
+export async function listFilesStream(
+  path = '/',
+  onItem: (file: FileItem) => void,
+  signal?: AbortSignal
+): Promise<{ files: FileItem[]; error?: string }> {
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/files/stream?path=${encodeURIComponent(path)}`, {
+    signal,
+  })
+
+  if (!response.ok) {
+    if (response.status === 403) {
+      throw new PermissionDeniedError('Permission denied')
+    }
+    if (response.status === 404) {
+      throw new NotFoundError('Path not found')
+    }
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+
+  const files: FileItem[] = []
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6).trim()
+        if (!data) continue
+
+        if (data === '[DONE]') {
+          return { files }
+        }
+
+        try {
+          const file = JSON.parse(data) as FileItem
+          files.push(file)
+          onItem(file)
+        } catch {
+          // skip malformed JSON
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  return { files }
+}
+
+export async function listPluginFilesStream(
+  path: string,
+  extensions: string[],
+  onItem: (file: FileItem) => void,
+  signal?: AbortSignal
+): Promise<{ files: FileItem[]; error?: string }> {
+  const baseUrl = getApiBaseUrl()
+  const extParam = extensions.map(e => `.${e.toLowerCase()}`).join(',')
+  const response = await fetch(`${baseUrl}/api/files/plugin-stream?path=${encodeURIComponent(path)}&extensions=${encodeURIComponent(extParam)}`, {
+    signal,
+  })
+
+  if (!response.ok) {
+    if (response.status === 403) {
+      throw new PermissionDeniedError('Permission denied')
+    }
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+
+  const files: FileItem[] = []
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6).trim()
+        if (!data) continue
+
+        if (data === '[DONE]') {
+          return { files }
+        }
+
+        try {
+          const file = JSON.parse(data) as FileItem
+          files.push(file)
+          onItem(file)
+        } catch {
+          // skip malformed JSON
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  return { files }
+}
+
 export interface BackendPermissions {
   storage: boolean
 }
@@ -151,6 +268,19 @@ export async function deleteFile(path: string): Promise<void> {
   }
 }
 
+export async function createDirectory(parentPath: string, name: string): Promise<void> {
+  console.info('[API] createDirectory:', parentPath, name)
+  const response = await fetch(`${getApiBaseUrl()}/api/files/mkdir`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent_path: parentPath, name }),
+  })
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(data.error || `Failed to create directory (${response.status})`)
+  }
+}
+
 export interface FileContentResponse {
   name: string
   path: string
@@ -186,6 +316,8 @@ export interface EncvTask {
   eta?: string
   error?: string
   errorDetail?: string
+  warning?: string
+  warningDetail?: string
   containerVersion?: number
   createdAt: string
   completedAt?: string
@@ -233,6 +365,17 @@ export async function retryTask(id: string): Promise<void> {
   const baseUrl = getApiBaseUrl()
   const response = await fetch(`${baseUrl}/api/tasks/${id}/retry`, {
     method: 'POST',
+  })
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export async function removeTask(id: string): Promise<void> {
+  console.info('[API] removeTask:', id)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/tasks/${id}`, {
+    method: 'DELETE',
   })
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`)
@@ -362,7 +505,7 @@ export async function fetchTextPreviewExts(): Promise<Set<string>> {
       return new Set()
     }
     const data = await response.json() as TextPreviewExts
-    const all = new Set([...data.extensions, ...data.custom_extensions])
+    const all = new Set([...(data.extensions || []), ...(data.custom_extensions || [])])
     cachedTextExts = all
     return all
   } catch (err: any) {
@@ -393,10 +536,9 @@ export function getFileExtension(name: string): string {
   return name.substring(lastDot + 1).toLowerCase()
 }
 
-export type FileCategory = 'video' | 'audio' | 'image' | 'document' | 'encrypted' | 'other'
+export type FileCategory = 'video' | 'audio' | 'image' | 'document' | 'other'
 
-export function getFileCategory(name: string, isEncrypted?: boolean): FileCategory {
-  if (isEncrypted) return 'encrypted'
+export function getFileCategory(name: string): FileCategory {
   const ext = getFileExtension(name)
   const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v']
   const audioExts = ['mp3', 'flac', 'wav', 'aac', 'ogg', 'wma', 'm4a']
@@ -663,4 +805,126 @@ export function isWrongPasswordError(error: unknown): boolean {
   }
   const msg = String(error).toLowerCase()
   return msg.includes('wrong password') || msg.includes('密码')
+}
+
+export async function renameFile(oldPath: string, newName: string): Promise<void> {
+  console.info('[API] renameFile:', oldPath, '→', newName)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/file/rename`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ oldPath, newName }),
+  })
+  if (!response.ok) {
+    console.error('[API] renameFile failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export async function copyFile(srcPath: string, destPath: string): Promise<void> {
+  console.info('[API] copyFile:', srcPath, '→', destPath)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/file/copy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ srcPath, destPath }),
+  })
+  if (!response.ok) {
+    console.error('[API] copyFile failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export async function moveFile(srcPath: string, destPath: string): Promise<void> {
+  console.info('[API] moveFile:', srcPath, '→', destPath)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/file/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ srcPath, destPath }),
+  })
+  if (!response.ok) {
+    console.error('[API] moveFile failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export interface PluginMeta {
+  name: string
+  supportedExtensions: string[]
+  supportedMimePrefixes: string[]
+  containerExtension: string
+}
+
+export async function fetchPlugins(): Promise<PluginMeta[]> {
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/plugins`)
+  if (!response.ok) {
+    console.error('[API] fetchPlugins failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+  const data = await response.json()
+  console.info('[API] fetchPlugins:', data.plugins?.length || 0, 'plugins')
+  return data.plugins || []
+}
+
+export interface TagInfo {
+  name: string
+  count: number
+}
+
+export async function fetchTags(): Promise<TagInfo[]> {
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/files/tags`)
+  if (!response.ok) {
+    console.error('[API] fetchTags failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+  const data = await response.json()
+  console.info('[API] fetchTags:', data.tags?.length || 0, 'tags')
+  return data.tags || []
+}
+
+export async function addTag(path: string, tag: string): Promise<void> {
+  console.info('[API] addTag:', path, tag)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/files/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, tag, action: 'add' }),
+  })
+  if (!response.ok) {
+    console.error('[API] addTag failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export async function removeTag(path: string, tag: string): Promise<void> {
+  console.info('[API] removeTag:', path, tag)
+  const baseUrl = getApiBaseUrl()
+  const response = await fetch(`${baseUrl}/api/files/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, tag, action: 'remove' }),
+  })
+  if (!response.ok) {
+    console.error('[API] removeTag failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+}
+
+export async function listFilesByTag(tag: string, path?: string): Promise<FileItem[]> {
+  const baseUrl = getApiBaseUrl()
+  const params = new URLSearchParams({
+    path: encodeURIComponent(path || '/'),
+    tag: encodeURIComponent(tag),
+  })
+  const response = await fetch(`${baseUrl}/api/files?${params}`)
+  if (!response.ok) {
+    console.error('[API] listFilesByTag failed:', response.status)
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+  const data: FileListResponse = await response.json()
+  console.info('[API] listFilesByTag:', tag, '→', data.files?.length || 0, 'files')
+  return data.files || []
 }

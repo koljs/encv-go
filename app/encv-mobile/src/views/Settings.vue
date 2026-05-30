@@ -45,9 +45,15 @@
             mode="ios"
           >
             <ion-select-option value="artplayer">{{ t('settings.builtInArtplayer') }}</ion-select-option>
-            <ion-select-option value="mpv-plugin">{{ t('settings.mpvPluginExtension') }}</ion-select-option>
+            <ion-select-option value="mpv-activity">MPV (Activity)</ion-select-option>
+            <ion-select-option value="mpv-fragment" :disabled="true">MPV (Fragment) [实验]</ion-select-option>
+            <ion-select-option value="mpv-compose" :disabled="true">MPV (Compose) [实验]</ion-select-option>
             <ion-select-option value="external">{{ t('settings.openExternal') }}</ion-select-option>
           </ion-select>
+          <ion-badge v-if="isNative() && isMpvMode(videoPlayerMode) && mpvPluginStatus !== 'unknown' && mpvPluginStatus !== 'ready'" slot="end" :color="mpvPluginStatus === 'load_failed' || mpvPluginStatus === 'error' ? 'danger' : 'warning'">
+            {{ t(mpvStatusI18nKey) }}
+          </ion-badge>
+          <ion-badge v-if="isNative() && isMpvMode(videoPlayerMode) && mpvPluginStatus === 'ready'" slot="end" color="success">✓</ion-badge>
         </ion-item>
         <ion-item>
           <ion-icon :icon="musicalNotesOutline" slot="start"></ion-icon>
@@ -149,27 +155,16 @@
             <ion-list-header>
               <ion-label>{{ section.sectionTitle ? tSectionTitle(section.sectionTitle) : tField(section.key) }}</ion-label>
             </ion-list-header>
-            <ion-item v-if="section.type === 'boolean'">
-              <ion-icon :icon="getFieldIcon(section.key, section.type)" slot="start"></ion-icon>
-              <ion-toggle
-                :checked="!!getValue([section.key])"
-                @ionChange="setValue([section.key], !getValue([section.key]))"
-              >{{ tField(section.key) }}</ion-toggle>
-            </ion-item>
-            <ion-item v-else>
-              <ion-icon :icon="getFieldIcon(section.key, section.type)" slot="start"></ion-icon>
-              <ion-input
-                :value="String(getValue([section.key]) ?? '')"
-                :type="section.isPassword ? 'password' : section.type === 'integer' ? 'number' : 'text'"
-                :label="fieldLabel(section.key, section.required)"
-                label-placement="stacked"
-                :placeholder="section.description || tField(section.key)"
-                @ionInput="handleInput([section.key], section, $event)"
-              ></ion-input>
-              <ion-button v-if="section.isPath" slot="end" fill="clear" class="browse-btn" @click="handleBrowsePath([section.key], section)">
-                <ion-icon :icon="folderOpen" slot="icon-only"></ion-icon>
-              </ion-button>
-            </ion-item>
+            <ConfigFieldItem
+              :field="section"
+              :model-value="getValue([section.key])"
+              :label="fieldLabel(section.key, section.required)"
+              :placeholder="section.description || tField(section.key)"
+              :icon="getFieldIcon(section.key, section.type)"
+              @update:model-value="setValue([section.key], $event)"
+              @input="handleInput([section.key], section, $event)"
+              @browse="handleBrowsePath([section.key], section)"
+            />
           </ion-list>
 
           <ion-list v-else>
@@ -184,27 +179,16 @@
                 </ion-item-divider>
                 <template v-for="grandchild in child.properties" :key="grandchild.key">
                   <template v-if="isFieldVisible(grandchild)">
-                    <ion-item v-if="grandchild.type === 'boolean'">
-                      <ion-icon :icon="getFieldIcon(grandchild.key, grandchild.type)" slot="start"></ion-icon>
-                      <ion-toggle
-                        :checked="!!getValue([section.key, child.key, grandchild.key])"
-                        @ionChange="setValue([section.key, child.key, grandchild.key], !getValue([section.key, child.key, grandchild.key]))"
-                      >{{ tField(grandchild.key) }}</ion-toggle>
-                    </ion-item>
-                    <ion-item v-else>
-                      <ion-icon :icon="getFieldIcon(grandchild.key, grandchild.type)" slot="start"></ion-icon>
-                      <ion-input
-                        :value="String(getValue([section.key, child.key, grandchild.key]) ?? '')"
-                        :type="grandchild.isPassword ? 'password' : grandchild.type === 'integer' ? 'number' : 'text'"
-                        :label="fieldLabel(grandchild.key, grandchild.required)"
-                        label-placement="stacked"
-                        :placeholder="grandchild.description || tField(grandchild.key)"
-                        @ionInput="handleInput([section.key, child.key, grandchild.key], grandchild, $event)"
-                      ></ion-input>
-                      <ion-button v-if="grandchild.isPath" slot="end" fill="clear" class="browse-btn" @click="handleBrowsePath([section.key, child.key, grandchild.key], grandchild)">
-                        <ion-icon :icon="folderOpen" slot="icon-only"></ion-icon>
-                      </ion-button>
-                    </ion-item>
+                    <ConfigFieldItem
+                      :field="grandchild"
+                      :model-value="getValue([section.key, child.key, grandchild.key])"
+                      :label="fieldLabel(grandchild.key, grandchild.required)"
+                      :placeholder="grandchild.description || tField(grandchild.key)"
+                      :icon="getFieldIcon(grandchild.key, grandchild.type)"
+                      @update:model-value="setValue([section.key, child.key, grandchild.key], $event)"
+                      @input="handleInput([section.key, child.key, grandchild.key], grandchild, $event)"
+                      @browse="handleBrowsePath([section.key, child.key, grandchild.key], grandchild)"
+                    />
                   </template>
                 </template>
               </template>
@@ -256,20 +240,17 @@
                     <ion-select-option value="error">ERROR</ion-select-option>
                   </ion-select>
                 </ion-item>
-                <ion-item v-else>
-                  <ion-icon :icon="getFieldIcon(child.key, child.type)" slot="start"></ion-icon>
-                  <ion-input
-                    :value="String(getValue([section.key, child.key]) ?? '')"
-                    :type="child.isPassword ? 'password' : child.type === 'integer' ? 'number' : 'text'"
-                    :label="fieldLabel(child.key, child.required)"
-                    label-placement="stacked"
-                    :placeholder="child.description || tField(child.key)"
-                    @ionInput="handleInput([section.key, child.key], child, $event)"
-                  ></ion-input>
-                  <ion-button v-if="child.isPath" slot="end" fill="clear" class="browse-btn" @click="handleBrowsePath([section.key, child.key], child)">
-                    <ion-icon :icon="folderOpen" slot="icon-only"></ion-icon>
-                  </ion-button>
-                </ion-item>
+                <ConfigFieldItem
+                  v-else
+                  :field="child"
+                  :model-value="getValue([section.key, child.key])"
+                  :label="fieldLabel(child.key, child.required)"
+                  :placeholder="child.description || tField(child.key)"
+                  :icon="getFieldIcon(child.key, child.type)"
+                  @update:model-value="setValue([section.key, child.key], $event)"
+                  @input="handleInput([section.key, child.key], child, $event)"
+                  @browse="handleBrowsePath([section.key, child.key], child)"
+                />
               </template>
             </template>
 
@@ -303,13 +284,16 @@
         </ion-item>
       </ion-list>
 
-      <ion-list>
+      <ion-list v-if="isNative()">
         <ion-list-header>
           <ion-label>{{ t('devtools.title') }}</ion-label>
         </ion-list-header>
-        <ion-item>
+        <ion-item button @click="goDevTools" detail>
           <ion-icon :icon="bugOutline" slot="start"></ion-icon>
-          <ion-toggle :checked="vconsoleEnabled" @ionChange="handleVConsoleToggle">{{ t('devtools.vconsole') }}</ion-toggle>
+          <ion-label>
+            <h3>{{ t('devtools.title') }}</h3>
+            <p>{{ t('devtools.devtoolsDesc') }}</p>
+          </ion-label>
         </ion-item>
       </ion-list>
 
@@ -370,7 +354,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   IonPage, IonHeader, IonToolbar, IonTitle, IonButtons, IonButton,
@@ -396,44 +380,60 @@ import { useServerStatus } from '@/composables/useServerStatus'
 import { useConfig } from '@/composables/useConfig'
 import { useI18n } from '@/composables/useI18n'
 import { showToast } from '@/composables/useToast'
-import { useDevTools } from '@/composables/useDevTools'
-import { isNative } from '@/plugins/GoProcess'
+import { isNative, getPluginFullState, ensurePluginLoaded } from '@/plugins/GoProcess'
 import { getIndexStats, fetchConfig, updateConfig, fetchFFmpegStatus, fetchTextPreviewExts, invalidateTextExtsCache } from '@/api/encv'
 import type { IndexStats, FFmpegStatus } from '@/api/encv'
 import type { FieldDef } from '@/config/schemaParser'
+import { PLAY_MODE, isMpvSubMode } from '@/constants/player'
 import FilePickerModal from '@/components/FilePickerModal.vue'
+import ConfigFieldItem from '@/components/ConfigFieldItem.vue'
 
 const router = useRouter()
 const { isDark, toggleDark } = useTheme()
 const { isOnline: serverOnline, lastError: connectionError, checkStatus, backendPort } = useServerStatus()
 const { schemaFields, loading: configLoading, dirty, restartNeeded, loadConfig, saveConfig, resetConfig, getFieldValue, setFieldValue } = useConfig()
 const { t, tField, tSectionTitle, setLocale, locale } = useI18n()
-const { vconsoleEnabled, toggleVConsole } = useDevTools()
 
 const configLoaded = ref(false)
 const indexStats = ref<IndexStats | null>(null)
 const engineStatus = ref<FFmpegStatus | null>(null)
 
-const videoPlayerMode = ref(localStorage.getItem('encv_player_video') || 'artplayer')
-
-if (videoPlayerMode.value === 'mpv') {
-  videoPlayerMode.value = 'mpv-plugin'
-}
-const audioPlayerMode = ref(localStorage.getItem('encv_player_audio') || 'mpv')
+const videoPlayerMode = ref(localStorage.getItem('encv_player_video') || PLAY_MODE.ARTPLAYER)
+const audioPlayerMode = ref(localStorage.getItem('encv_player_audio') || PLAY_MODE.MPV_PLUGIN)
 const screenOrientation = ref(localStorage.getItem('encv_screen_orientation') || 'auto')
 const customTextExts = ref('')
 const builtInTextExtsCount = ref(0)
+const mpvPluginStatus = ref<string>('unknown')
+const mpvPluginError = ref<string>('')
 
-function handleVideoPlayerChange(event: CustomEvent) {
+const mpvStatusI18nKey = computed(() => {
+  const keyMap: Record<string, string> = {
+    not_installed: 'settings.pluginNotInstalled',
+    disabled: 'settings.pluginDisabled',
+    not_loaded: 'settings.pluginNotLoaded',
+    load_failed: 'settings.pluginLoadFailed',
+    error: 'settings.pluginQueryFailed',
+    framework_not_ready: 'settings.pluginFrameworkNotReady',
+  }
+  return keyMap[mpvPluginStatus.value] || 'settings.pluginQueryFailed'
+})
+
+function isMpvMode(mode: string): boolean {
+  return isMpvSubMode(mode) || mode === 'mpv-plugin' || mode === 'mpv'
+}
+
+async function handleVideoPlayerChange(event: CustomEvent) {
   const value = event.detail.value
   videoPlayerMode.value = value
   localStorage.setItem('encv_player_video', value)
+  if (isMpvMode(value)) await refreshMpvPluginStatus()
 }
 
-function handleAudioPlayerChange(event: CustomEvent) {
+async function handleAudioPlayerChange(event: CustomEvent) {
   const value = event.detail.value
   audioPlayerMode.value = value
   localStorage.setItem('encv_player_audio', value)
+  if (isMpvMode(value)) await refreshMpvPluginStatus()
 }
 
 function handleScreenOrientationChange(event: CustomEvent) {
@@ -492,8 +492,8 @@ function handleCustomTextExtsChange(event: CustomEvent) {
   })()
 }
 
-function handleVConsoleToggle(event: CustomEvent) {
-  toggleVConsole(event.detail.checked)
+function goDevTools() {
+  router.push('/tabs/settings/devtools')
 }
 
 const showJsonEditor = ref(false)
@@ -600,11 +600,26 @@ function getMapEntries(path: string[]): [string, Record<string, unknown>][] {
 
 function handleInput(path: string[], field: FieldDef, event: CustomEvent) {
   const val = (event.target as HTMLInputElement).value
+  if (path.length >= 2 && path[0] === 'webdav' && path[1] === 'root' && val) {
+    const err = validateWebdavRoute(val)
+    if (err) {
+      showToast({ message: err, duration: 3000, color: 'danger' })
+      return
+    }
+  }
   if (field.type === 'integer') {
     setFieldValue(path, val ? Number(val) : 0)
   } else {
     setFieldValue(path, val)
   }
+}
+
+function validateWebdavRoute(val: string): string | null {
+  const t = val.trim()
+  if (!t) return null
+  if (t === '/' || t === '//') return "WebDAV 路由不能为 \"/\"，这会导致服务崩溃"
+  if (!t.startsWith('/')) return 'WebDAV 路由必须以 "/" 开头'
+  return null
 }
 
 async function handleBrowsePath(path: string[], field: FieldDef) {
@@ -676,6 +691,7 @@ function getFieldIcon(fieldKey: string, fieldType: string): string {
 }
 
 function isFieldVisible(field: FieldDef): boolean {
+  if (field.key === 'console') return false
   if (!field.platform || field.platform === 'both') return true
   if (field.platform === 'mobile') return isNative()
   if (field.platform === 'desktop') return !isNative()
@@ -726,10 +742,51 @@ onMounted(async () => {
     await loadConfig()
     configLoaded.value = true
     try { indexStats.value = await getIndexStats() } catch {}
-    if (isNative()) { try { engineStatus.value = await fetchFFmpegStatus() } catch {} }
+    if (isNative()) { 
+      try { engineStatus.value = await fetchFFmpegStatus() } catch {}
+      await refreshMpvPluginStatus()
+    }
     loadPreviewConfig()
   }
+  window.addEventListener('plugin-state-changed', refreshMpvPluginStatus)
 })
+
+onUnmounted(() => {
+  window.removeEventListener('plugin-state-changed', refreshMpvPluginStatus)
+})
+
+async function refreshMpvPluginStatus() {
+  try {
+    const state = await getPluginFullState('com.encvgo.plugin.mpv')
+    console.info('[Settings] MPV plugin raw state:', JSON.stringify(state))
+    mpvPluginError.value = ''
+    
+    if (state.status === 'ready') {
+      mpvPluginStatus.value = 'ready'
+      return
+    }
+    
+    if (state.status === 'not_loaded' || state.status === 'not_installed') {
+      console.info('[Settings] MPV plugin status=${state.status}, attempting to load...')
+      const loaded = await ensurePluginLoaded('com.encvgo.plugin.mpv')
+      if (loaded) {
+        mpvPluginStatus.value = 'ready'
+        console.info('[Settings] MPV plugin loaded successfully')
+      } else {
+        mpvPluginStatus.value = 'load_failed'
+        mpvPluginError.value = '插件加载失败'
+        console.warn('[Settings] MPV plugin load failed')
+      }
+    } else {
+      mpvPluginStatus.value = state.status
+      console.warn('[Settings] MPV plugin status:', state.status)
+    }
+  } catch (e: any) {
+    console.error('[Settings] refreshMpvPluginStatus failed:', e)
+    mpvPluginStatus.value = 'error'
+    mpvPluginError.value = e.message || '查询失败'
+  }
+}
 
 watch(serverOnline, async (online) => {
   if (online) {

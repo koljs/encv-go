@@ -30,7 +30,25 @@ func (s *Server) handleGetConfigGin(c *gin.Context) {
 		return
 	}
 
-	c.Data(http.StatusOK, "application/json", data)
+	var cfg config.Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		slog.Error("Failed to parse config file", "path", s.configPath, "error", err)
+		c.Data(http.StatusOK, "application/json", data)
+		return
+	}
+
+	if os.Getenv("ENCV_MOBILE") == "1" && cfg.Mobile != nil {
+		config.ApplyMobileOverrides(&cfg)
+	}
+
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		slog.Error("Failed to marshal processed config", "error", err)
+		c.Data(http.StatusOK, "application/json", data)
+		return
+	}
+
+	c.Data(http.StatusOK, "application/json", out)
 }
 
 func (s *Server) handlePutConfigGin(c *gin.Context) {
@@ -51,6 +69,11 @@ func (s *Server) handlePutConfigGin(c *gin.Context) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
+		return
+	}
+
+	if errMsg := validateWebdavRouteInConfig(raw); errMsg != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return
 	}
 
@@ -159,4 +182,23 @@ func (s *Server) handleConfigSchemaGin(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNotFound, gin.H{"error": "schema file not found"})
+}
+
+func validateWebdavRouteInConfig(raw map[string]interface{}) string {
+	wd, ok := raw["webdav"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	root, ok := wd["root"].(string)
+	if !ok || root == "" {
+		return ""
+	}
+	cleaned := strings.TrimSpace(root)
+	if cleaned == "/" || cleaned == "//" {
+		return "webdav root cannot be '/' (would capture all routes and crash server)"
+	}
+	if !strings.HasPrefix(cleaned, "/") {
+		return "webdav root must start with '/'"
+	}
+	return ""
 }

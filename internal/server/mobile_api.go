@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 	"github.com/Soltus/encv-go/internal/config"
 	mobileservice "github.com/Soltus/encv-go/internal/service"
 	"github.com/Soltus/encv-go/internal/utils"
+	"github.com/Soltus/encv-go/internal/v2/container/detector"
+	"github.com/Soltus/encv-go/internal/v2/plugins"
 	"github.com/Soltus/encv-go/internal/v2/types"
 )
 
@@ -88,6 +92,21 @@ func (s *Server) handleListFilesGin(c *gin.Context) {
 		return
 	}
 
+	if tag := c.Query("tag"); tag != "" {
+		taggedPaths := GlobalTagStore.GetFilesByTag(tag)
+		taggedSet := make(map[string]bool, len(taggedPaths))
+		for _, p := range taggedPaths {
+			taggedSet[p] = true
+		}
+		filtered := make([]mobileservice.FileInfo, 0, len(files))
+		for _, f := range files {
+			if taggedSet[f.Path] {
+				filtered = append(filtered, f)
+			}
+		}
+		files = filtered
+	}
+
 	slog.Info("API: list files result", "path", queryPath, "count", len(files))
 	c.JSON(http.StatusOK, gin.H{"files": files})
 }
@@ -103,6 +122,27 @@ func (s *Server) handleDeleteFileGin(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
+}
+
+func (s *Server) handleCreateDirectoryGin(c *gin.Context) {
+	var req struct {
+		ParentPath string `json:"parent_path"`
+		Name       string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	slog.Info("API: create directory", "parent_path", req.ParentPath, "name", req.Name)
+
+	err := s.mobileSvc.CreateDirectory(req.ParentPath, req.Name)
+	if err != nil {
+		writeServiceErrorGin(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "created"})
 }
 
 func (s *Server) handleReadFileContentGin(c *gin.Context) {
@@ -195,6 +235,17 @@ func (s *Server) handleRetryTaskGin(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, task)
+}
+
+func (s *Server) handleRemoveTaskGin(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.mobileSvc.GetTaskManager().RemoveTask(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (s *Server) handleTestWebDAVGin(c *gin.Context) {
@@ -663,4 +714,258 @@ func (s *Server) handleFFmpegStatusGin(c *gin.Context) {
 		"ffmpeg_detail":      ffmpegDetail,
 		"ffprobe_detail":     ffprobeDetail,
 	})
+}
+
+func (s *Server) handleTagsListGin(c *gin.Context) {
+	allTags := GlobalTagStore.GetAllTags()
+	type tagEntry struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}
+	result := make([]tagEntry, 0, len(allTags))
+	for name, count := range allTags {
+		result = append(result, tagEntry{Name: name, Count: count})
+	}
+	c.JSON(http.StatusOK, gin.H{"tags": result})
+}
+
+func (s *Server) handleTagsMutateGin(c *gin.Context) {
+	var req struct {
+		Path   string `json:"path"`
+		Tag    string `json:"tag"`
+		Action string `json:"action"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
+		return
+	}
+	if req.Path == "" || req.Tag == "" || req.Action == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path, tag and action are required"})
+		return
+	}
+
+	switch req.Action {
+	case "add":
+		GlobalTagStore.AddTag(req.Path, req.Tag)
+		c.JSON(http.StatusOK, gin.H{"message": "tag added"})
+	case "remove":
+		GlobalTagStore.RemoveTag(req.Path, req.Tag)
+		c.JSON(http.StatusOK, gin.H{"message": "tag removed"})
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be 'add' or 'remove'"})
+	}
+}
+
+type PluginMeta struct {
+	Name                  string   `json:"name"`
+	SupportedExtensions   []string `json:"supportedExtensions"`
+	SupportedMimePrefixes []string `json:"supportedMimePrefixes"`
+	ContainerExtension    string   `json:"containerExtension"`
+}
+
+func (s *Server) handlePluginsGin(c *gin.Context) {
+	var metas []PluginMeta
+	for _, p := range plugins.Plugins {
+		metas = append(metas, PluginMeta{
+			Name:                  p.Name(),
+			SupportedExtensions:   p.SupportedExtensions(),
+			SupportedMimePrefixes: p.SupportedMimePrefixes(),
+			ContainerExtension:    p.GetContainerExtension(),
+		})
+	}
+	c.JSON(200, gin.H{"plugins": metas})
+}
+
+func (s *Server) writeSSEEvent(c *gin.Context, flusher http.Flusher, data string) {
+	c.Writer.Write([]byte("data: " + data + "\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) handleListFilesStreamGin(c *gin.Context) {
+	queryPath := c.Query("path")
+	if queryPath == "" {
+		queryPath = "/"
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		flusher = nil
+	}
+
+	absPath, err := utils.SafeURLToAbsPath(s.servingDir, queryPath)
+	if err != nil {
+		s.writeSSEEvent(c, flusher, `{"error":"invalid path"}`)
+		s.writeSSEEvent(c, flusher, `[DONE]`)
+		return
+	}
+
+	entries, err := os.ReadDir(absPath)
+	if err != nil {
+		errMsg := fmt.Sprintf(`{"error":"cannot read directory: %s"}`, err.Error())
+		s.writeSSEEvent(c, flusher, errMsg)
+		s.writeSSEEvent(c, flusher, `[DONE]`)
+		return
+	}
+
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		filePath := queryPath + "/" + entry.Name()
+		if queryPath == "/" {
+			filePath = "/" + entry.Name()
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			fi := mobileservice.FileInfo{
+				Name:        entry.Name(),
+				Path:        filePath,
+				IsDirectory: entry.IsDir(),
+				Size:        0,
+				Modified:    "",
+			}
+			data, _ := json.Marshal(fi)
+			s.writeSSEEvent(c, flusher, string(data))
+			continue
+		}
+
+		isEncrypted := false
+		if !entry.IsDir() {
+			entryAbsPath := filepath.Join(absPath, entry.Name())
+			if _, detectErr := detector.DetectContainer(entryAbsPath); detectErr == nil {
+				isEncrypted = true
+			}
+		}
+
+		fi := mobileservice.FileInfo{
+			Name:        entry.Name(),
+			Path:        filePath,
+			IsDirectory: entry.IsDir(),
+			IsEncrypted: isEncrypted,
+			Size:        info.Size(),
+			Modified:    info.ModTime().Format(time.RFC3339),
+		}
+		data, _ := json.Marshal(fi)
+		s.writeSSEEvent(c, flusher, string(data))
+	}
+
+	s.writeSSEEvent(c, flusher, `[DONE]`)
+}
+
+func (s *Server) handlePluginFilesStreamGin(c *gin.Context) {
+	queryPath := c.Query("path")
+	if queryPath == "" {
+		queryPath = "/"
+	}
+	extensionsStr := c.Query("extensions")
+	if extensionsStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "'extensions' query parameter is required"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	c.Status(http.StatusOK)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		flusher = nil
+	}
+
+	absPath, err := utils.SafeURLToAbsPath(s.servingDir, queryPath)
+	if err != nil {
+		s.writeSSEEvent(c, flusher, `{"error":"invalid path"}`)
+		s.writeSSEEvent(c, flusher, `[DONE]`)
+		return
+	}
+
+	extSet := make(map[string]bool)
+	for _, ext := range strings.Split(extensionsStr, ",") {
+		e := strings.TrimSpace(strings.ToLower(ext))
+		if e != "" {
+			extSet[e] = true
+		}
+	}
+
+	const maxResults = 500
+	count := 0
+
+	err = filepath.WalkDir(absPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if count >= maxResults {
+			return fs.SkipAll
+		}
+
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(name))
+		if !extSet[ext] {
+			return nil
+		}
+
+		relPath, _ := filepath.Rel(absPath, path)
+		filePath := queryPath + "/" + relPath
+		if queryPath == "/" {
+			filePath = "/" + relPath
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			fi := mobileservice.FileInfo{
+				Name:        name,
+				Path:        filePath,
+				IsDirectory: false,
+				Size:        0,
+				Modified:    "",
+			}
+			data, _ := json.Marshal(fi)
+			s.writeSSEEvent(c, flusher, string(data))
+			count++
+			return nil
+		}
+
+		isEncrypted := false
+		if _, detectErr := detector.DetectContainer(path); detectErr == nil {
+			isEncrypted = true
+		}
+
+		fi := mobileservice.FileInfo{
+			Name:        name,
+			Path:        filePath,
+			IsDirectory: false,
+			IsEncrypted: isEncrypted,
+			Size:        info.Size(),
+			Modified:    info.ModTime().Format(time.RFC3339),
+		}
+		data, _ := json.Marshal(fi)
+		s.writeSSEEvent(c, flusher, string(data))
+		count++
+		return nil
+	})
+
+	if err != nil && count < maxResults {
+		errMsg := fmt.Sprintf(`{"error":"walk failed: %s"}`, err.Error())
+		s.writeSSEEvent(c, flusher, errMsg)
+	}
+
+	s.writeSSEEvent(c, flusher, `[DONE]`)
 }

@@ -82,6 +82,23 @@
             {{ isInstalling ? t('extensions.installing') : t('extensions.selectApk') }}
           </ion-button>
           <p class="install-hint">{{ t('extensions.installFromLocalHint') }}</p>
+          <div v-if="isNativePlatform()" style="margin-top: 12px; display: flex; flex-direction: column; gap: 6px;">
+            <ion-button expand="block" fill="outline" color="warning" @click="handleDebugInstall" size="small">
+              🔧 installPlugin实际调用
+            </ion-button>
+            <ion-button expand="block" fill="outline" color="warning" @click="handleDebugKotlinReflect" size="small">
+              🔧 kotlin-reflect健康检查
+            </ion-button>
+            <ion-button expand="block" fill="outline" color="warning" @click="handleDebugApkValidation" size="small">
+              🔧 APK元数据+签名校验
+            </ion-button>
+            <ion-button expand="block" fill="outline" color="warning" @click="handleDebugValidationStrategy" size="small">
+              🔧 ValidationStrategy状态
+            </ion-button>
+            <ion-button expand="block" fill="outline" color="warning" @click="handleDebugLifecycle" size="small">
+              🔧 插件生命周期诊断(禁用/卸载/Activity)
+            </ion-button>
+          </div>
         </div>
       </template>
 
@@ -111,7 +128,6 @@ import {
   IonIcon,
   IonSpinner,
   alertController,
-  modalController,
 } from '@ionic/vue'
 import {
   filmOutline,
@@ -124,8 +140,8 @@ import {
 } from 'ionicons/icons'
 import { useI18n } from '@/composables/useI18n'
 import { Capacitor } from '@capacitor/core'
-import { GoProcess, isNative } from '@/plugins/GoProcess'
-import FilePickerModal from '@/components/FilePickerModal.vue'
+import { isNative, pickAndInstallPlugin, checkInstalledPlugins, debugInstallFlow, debugKotlinReflect, debugApkValidation, debugValidationStrategy, togglePluginEnabled, uninstallPlugin, debugLifecycleFlow } from '@/plugins/GoProcess'
+import { showToast } from '@/composables/useToast'
 
 const { t } = useI18n()
 
@@ -154,27 +170,20 @@ onMounted(async () => {
 async function loadExtensions() {
   isLoading.value = true
   try {
-    if (!Capacitor.isNativePlatform()) {
-      extensions.value = [
-        {
-          id: 'mpv-player',
-          name: t('extensions.mpvPlayer'),
-          description: t('extensions.mpvPlayerDesc'),
-          installed: false,
-          enabled: false,
-          sizeDisplay: '~35 MB',
-        },
-      ]
-      return
+    const COMBOLITE_PLUGIN_ID_MAP: Record<string, string> = {
+      'mpv-player': 'com.encvgo.plugin.mpv',
     }
 
+    interface PluginStatus { installed: boolean; enabled: boolean; versionName: string }
+    const installedMap: Record<string, PluginStatus> = Capacitor.isNativePlatform() ? await checkInstalledPlugins() : {}
+    const mpvInfo = installedMap[COMBOLITE_PLUGIN_ID_MAP['mpv-player']]
     extensions.value = [
       {
         id: 'mpv-player',
         name: t('extensions.mpvPlayer'),
         description: t('extensions.mpvPlayerDesc'),
-        installed: false,
-        enabled: false,
+        installed: !!mpvInfo?.installed,
+        enabled: mpvInfo?.enabled ?? false,
         sizeDisplay: '~35 MB',
       },
     ]
@@ -188,40 +197,25 @@ async function loadExtensions() {
 async function handleInstallFromFile() {
   if (!isNativePlatform()) return
 
-  const modal = await modalController.create({
-    component: FilePickerModal,
-    componentProps: { mode: 'file', initialPath: '/storage/emulated/0' },
-  })
-  await modal.present()
-  const { data, role } = await modal.onDidDismiss<{ path: string; name: string }>()
-  if (role !== 'select' || !data?.path) return
-
-  const apkPath = data.path
-  if (!apkPath.endsWith('.apk')) {
-    installError.value = t('extensions.notApkFile')
-    return
-  }
-
   isInstalling.value = true
   installError.value = ''
 
   try {
-    const result = await GoProcess.installPlugin({ apkPath })
+    const result = await Promise.race([
+      pickAndInstallPlugin(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Installation timeout')), 120000)),
+    ])
     if (result.success) {
-      const alert = await alertController.create({
-        header: t('extensions.installSuccess'),
-        message: `${data.name}\n${t('extensions.installHint')}`,
-        buttons: [t('common.confirm')],
-      })
-      await alert.present()
+      showToast({ message: t('extensions.installSuccess'), duration: 2000, color: 'success' })
+      window.dispatchEvent(new CustomEvent('plugin-state-changed'))
+      await loadExtensions()
     } else {
-      installError.value = t('extensions.installFailed')
+      installError.value = result.error || t('extensions.installFailed')
     }
   } catch (e: any) {
     installError.value = e.message || t('extensions.installFailed')
   } finally {
     isInstalling.value = false
-    await loadExtensions()
   }
 }
 
@@ -230,11 +224,33 @@ async function handleInstall(_id: string) {
 }
 
 async function handleToggleEnabled(id: string, currentEnabled: boolean) {
-  console.log('Toggle extension:', id, '→', !currentEnabled)
+  if (!isNativePlatform()) return
+  const COMBO_LITE_ID: Record<string, string> = {
+    'mpv-player': 'com.encvgo.plugin.mpv',
+  }
+  const pluginId = COMBO_LITE_ID[id] || id
+  const newEnabled = !currentEnabled
+  console.log('Toggle extension:', id, '→', newEnabled ? 'ENABLED' : 'DISABLED')
+  try {
+    const result = await togglePluginEnabled(pluginId, newEnabled)
+    if (result.success) {
+      showToast({ message: newEnabled ? t('extensions.enabled') : t('extensions.disabled'), duration: 1500, color: 'success' })
+      window.dispatchEvent(new CustomEvent('plugin-state-changed'))
+    } else {
+      showToast({ message: t('extensions.toggleFailed'), duration: 2000, color: 'danger' })
+    }
+  } catch (e: any) {
+    console.error('togglePluginEnabled failed:', e)
+    showToast({ message: e?.message || t('extensions.toggleFailed'), duration: 2000, color: 'danger' })
+  }
   await loadExtensions()
 }
 
 async function handleUninstall(id: string) {
+  const COMBO_LITE_ID: Record<string, string> = {
+    'mpv-player': 'com.encvgo.plugin.mpv',
+  }
+  const pluginId = COMBO_LITE_ID[id] || id
   const alert = await alertController.create({
     header: t('extensions.uninstallConfirm'),
     buttons: [
@@ -243,13 +259,97 @@ async function handleUninstall(id: string) {
         text: t('common.confirm'),
         role: 'confirm',
         handler: async () => {
-          console.log('Uninstall extension:', id)
+          if (!isNativePlatform()) return
+          console.log('Uninstall extension:', pluginId)
+          try {
+            const result = await uninstallPlugin(pluginId)
+            if (result.success) {
+              showToast({ message: t('extensions.uninstalled'), duration: 1500, color: 'success' })
+              window.dispatchEvent(new CustomEvent('plugin-state-changed'))
+            } else {
+              showToast({ message: t('extensions.uninstallFailed'), duration: 2000, color: 'danger' })
+            }
+          } catch (e: any) {
+            console.error('uninstallPlugin failed:', e)
+            showToast({ message: e?.message || t('extensions.uninstallFailed'), duration: 2000, color: 'danger' })
+          }
           await loadExtensions()
         },
       },
     ],
   })
   await alert.present()
+}
+
+async function showDebugResult(header: string, result: Record<string, any>) {
+  const debugText = result.debugLog || Object.entries(result)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n')
+  const alert = await alertController.create({
+    header,
+    message: `<pre style="font-size:12px;white-space:pre-wrap;max-height:60vh;overflow:auto;">${debugText}</pre>`,
+    buttons: [
+      {
+        text: '复制',
+        handler: async () => {
+          try {
+            await navigator.clipboard.writeText(debugText)
+            showToast({ message: '已复制诊断信息', duration: 1500, color: 'success' })
+          } catch {
+            showToast({ message: '复制失败', duration: 1500, color: 'danger' })
+          }
+          return false
+        },
+      },
+      'OK',
+    ],
+  })
+  await alert.present()
+}
+
+async function handleDebugInstall() {
+  try {
+    const result = await debugInstallFlow()
+    await showDebugResult('🔧 installPlugin诊断', result)
+  } catch (e: any) {
+    await showDebugResult('🔧 诊断失败', { debugLog: e?.message || String(e) })
+  }
+}
+
+async function handleDebugKotlinReflect() {
+  try {
+    const result = await debugKotlinReflect()
+    await showDebugResult('🔧 kotlin-reflect诊断', result)
+  } catch (e: any) {
+    await showDebugResult('🔧 诊断失败', { debugLog: e?.message || String(e) })
+  }
+}
+
+async function handleDebugApkValidation() {
+  try {
+    const result = await debugApkValidation()
+    await showDebugResult('🔧 APK校验诊断', result)
+  } catch (e: any) {
+    await showDebugResult('🔧 诊断失败', { debugLog: e?.message || String(e) })
+  }
+}
+
+async function handleDebugValidationStrategy() {
+  try {
+    const result = await debugValidationStrategy()
+    await showDebugResult('🔧 ValidationStrategy诊断', result)
+  } catch (e: any) {
+    await showDebugResult('🔧 诊断失败', { debugLog: e?.message || String(e) })
+  }
+}
+
+async function handleDebugLifecycle() {
+  try {
+    const result = await debugLifecycleFlow('com.encvgo.plugin.mpv')
+    await showDebugResult('🔧 插件生命周期诊断', result)
+  } catch (e: any) {
+    await showDebugResult('🔧 诊断失败', { debugLog: e?.message || String(e) })
+  }
 }
 </script>
 

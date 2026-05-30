@@ -2,7 +2,6 @@ package com.encvgo.plugin.mpv
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
-import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -12,7 +11,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -20,6 +18,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
@@ -30,9 +29,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 
-private val SPEED_OPTIONS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+private val SPEED_ANCHORS = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f, 3f)
 private const val CONTROLS_HIDE_DELAY_MS = 3000L
-private const val LOADING_TIMEOUT_MS = 15_000L
 private const val POSITION_UPDATE_INTERVAL_MS = 1000L
 
 @Composable
@@ -41,6 +39,7 @@ fun MpvPlayerScreen(
     fileName: String,
     mimeType: String,
     isExternal: Boolean,
+    backendUrl: String,
     engine: MpvEngine,
     onBack: () -> Unit
 ) {
@@ -50,10 +49,15 @@ fun MpvPlayerScreen(
     var showControls by remember { mutableStateOf(true) }
     var isLocked by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
-    var playbackSpeed by remember { mutableFloatStateOf(1f) }
+    var playbackSpeed by remember { mutableStateOf(1f) }
+    var volume by remember { mutableStateOf(1f) }
+    var subtitleTracks by remember { mutableStateOf<List<MpvEngine.TrackInfo>>(emptyList()) }
+    var audioTracks by remember { mutableStateOf<List<MpvEngine.TrackInfo>>(emptyList()) }
+    var currentSubtitleId by remember { mutableStateOf(-1) }
+    var currentAudioId by remember { mutableStateOf(-1) }
+    var bgPlaybackEnabled by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val backendUrl = (context as? Activity)?.intent?.getStringExtra("backend_url") ?: ""
 
     LaunchedEffect(filePath) {
         startPlayback(
@@ -68,9 +72,30 @@ fun MpvPlayerScreen(
         )
     }
 
+    DisposableEffect(engine) {
+        val listener: (MpvEngine.State) -> Unit = { state ->
+            when (state) {
+                is MpvEngine.State.Playing -> playerState = PlayerState.Playing
+                is MpvEngine.State.Paused -> playerState = PlayerState.Paused
+                is MpvEngine.State.AudioOnly -> playerState = PlayerState.AudioOnly
+                is MpvEngine.State.Ended -> playerState = PlayerState.Ended
+                is MpvEngine.State.Error -> playerState = PlayerState.Error(classifyError(state.message), state.message)
+                is MpvEngine.State.SurfaceReady -> { }
+                is MpvEngine.State.WaitingSurface -> { }
+                is MpvEngine.State.MpvReady -> { }
+            }
+        }
+        engine.stateListener = listener
+        onDispose {
+            engine.stateListener = null
+        }
+    }
+
     LaunchedEffect(playerState) {
         if (playerState == PlayerState.Playing || playerState == PlayerState.Paused || playerState == PlayerState.AudioOnly) {
             showControls = true
+            subtitleTracks = engine.getTrackList("sub")
+            audioTracks = engine.getTrackList("audio")
         }
     }
 
@@ -109,12 +134,11 @@ fun MpvPlayerScreen(
 
     Surface(
         modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.background
+        color = Color.Transparent
     ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onTap = {
@@ -135,7 +159,13 @@ fun MpvPlayerScreen(
                 isLocked = isLocked,
                 isFullscreen = isFullscreen,
                 playbackSpeed = playbackSpeed,
+                volume = volume,
                 showControls = showControls,
+                subtitleTracks = subtitleTracks,
+                audioTracks = audioTracks,
+                currentSubtitleId = currentSubtitleId,
+                currentAudioId = currentAudioId,
+                bgPlaybackEnabled = bgPlaybackEnabled,
                 onPlayPause = {
                     when (playerState) {
                         is PlayerState.Playing -> {
@@ -147,11 +177,7 @@ fun MpvPlayerScreen(
                             playerState = PlayerState.Playing
                         }
                         is PlayerState.AudioOnly -> {
-                            if (engine.isPlaying()) {
-                                engine.pause()
-                            } else {
-                                engine.resume()
-                            }
+                            if (engine.isPlaying()) engine.pause() else engine.resume()
                         }
                         else -> {
                             scope.launch {
@@ -185,16 +211,14 @@ fun MpvPlayerScreen(
                     isLocked = !isLocked
                     showControls = true
                 },
-                onChangeSpeed = {
-                    val currentIdx = SPEED_OPTIONS.indexOf(playbackSpeed).coerceAtLeast(0)
-                    playbackSpeed = SPEED_OPTIONS[(currentIdx + 1) % SPEED_OPTIONS.size]
+                onChangeSpeed = { newSpeed ->
+                    playbackSpeed = newSpeed
                     engine.setProperty("speed", playbackSpeed.toString())
                     showControls = true
                 },
                 onToggleFullscreen = {
                     isFullscreen = !isFullscreen
                     val activity = context as? Activity ?: return@MpvControls
-
                     if (isFullscreen) {
                         activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                         hideSystemUi(activity)
@@ -202,6 +226,42 @@ fun MpvPlayerScreen(
                         activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                         showSystemUi(activity)
                     }
+                    showControls = true
+                },
+                onVolumeChange = { vol ->
+                    volume = vol
+                    engine.setVolume(vol)
+                    showControls = true
+                },
+                onSelectSubtitle = { id ->
+                    if (id <= 0) {
+                        engine.setTrack("sid", 0)
+                    } else {
+                        engine.setTrack("sid", id)
+                    }
+                    currentSubtitleId = id
+                    showControls = true
+                },
+                onSelectAudio = { id ->
+                    engine.setTrack("aid", id)
+                    currentAudioId = id
+                    showControls = true
+                },
+                onAddSubtitleFile = { path ->
+                    engine.addSubtitleFile(path)
+                    subtitleTracks = engine.getTrackList("sub")
+                    showControls = true
+                },
+                onToggleBgPlayback = { enabled ->
+                    bgPlaybackEnabled = enabled
+                    showControls = true
+                },
+                onToggleSubtitle = {
+                    engine.toggleSubtitleVisibility()
+                    showControls = true
+                },
+                onCycleAudio = {
+                    engine.cycleAudioTrack()
                     showControls = true
                 },
                 onRetry = {
@@ -227,7 +287,7 @@ fun MpvPlayerScreen(
     }
 }
 
-private suspend fun startPlayback(
+internal suspend fun startPlayback(
     filePath: String,
     fileName: String,
     isExternal: Boolean,
@@ -247,53 +307,31 @@ private suspend fun startPlayback(
     try {
         val streamUrl = resolveStreamUrl(filePath, isExternal, backendUrl)
 
-        if (streamUrl.isEmpty() || !streamUrl.startsWith("http")) {
-            if (streamUrl.isEmpty()) {
-                onError("Unable to get stream URL")
-                return
-            }
+        if (streamUrl.isEmpty()) {
+            onError("Unable to get stream URL")
+            return
         }
 
         engine.play(streamUrl)
-        onStateChange(PlayerState.Loading)
     } catch (e: Exception) {
         val msg = e.message ?: e.toString()
         onError("Playback error: $msg")
     }
 }
 
-private suspend fun resolveStreamUrl(filePath: String, isExternal: Boolean, backendUrl: String): String {
-    return try {
-        if (isExternal && filePath.startsWith("/")) {
-            if (java.io.File(filePath).exists()) {
-                return filePath
-            }
-        }
-
-        if (backendUrl.isEmpty()) {
-            if (java.io.File(filePath).exists()) return filePath
-            return ""
-        }
-
-        val encodedPath = java.net.URLEncoder.encode(filePath, "UTF-8")
-        val url = if (isExternal) {
-            "$backendUrl/api/stream/external?path=$encodedPath"
-        } else {
-            "$backendUrl/stream?path=$encodedPath"
-        }
-
-        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        conn.requestMethod = "HEAD"
-        conn.connectTimeout = 5000
-        conn.readTimeout = 5000
-        val responseCode = conn.responseCode
-        conn.disconnect()
-
-        if (responseCode in 200..299) url else ""
-    } catch (e: Exception) {
-        android.util.Log.w("MpvPlayer", "resolveStreamUrl failed: ${e.message}")
-        ""
+internal suspend fun resolveStreamUrl(filePath: String, isExternal: Boolean, backendUrl: String): String {
+    if (backendUrl.isEmpty()) {
+        android.util.Log.w("MpvPlayer", "resolveStreamUrl: backendUrl is empty")
+        return ""
     }
+    val encodedPath = java.net.URLEncoder.encode(filePath, "UTF-8")
+    val url = if (isExternal) {
+        "$backendUrl/api/stream/external?path=$encodedPath"
+    } else {
+        "$backendUrl/stream?path=$encodedPath"
+    }
+    android.util.Log.i("MpvPlayer", "resolveStreamUrl: $url")
+    return url
 }
 
 private fun hideSystemUi(activity: Activity) {

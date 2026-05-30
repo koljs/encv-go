@@ -102,6 +102,14 @@ jobs:
       - name: Install frontend dependencies & Build
         run: cd app/encv-mobile && npm install && npm run build
 
+      - name: Run frontend unit tests (vitest)
+        run: |
+          cd app/encv-mobile
+          echo "═══ Frontend Unit Tests ═══"
+          npx vitest run --reporter=verbose 2>&1 | tail -30
+          echo ""
+          echo "═══ Frontend Test Summary ═══"
+
       - name: Download MPV native libraries from Release
         if: inputs.skip_plugin != true
         run: |
@@ -132,6 +140,20 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Run Go unit tests
+        run: |
+          echo "═══ Go Unit Tests (service layer) ═══"
+          go test ./internal/service/ -count=1 -timeout 120s -v 2>&1 | tail -30
+          echo ""
+          echo "═══ Go Unit Tests (video plugin) ═══"
+          go test ./internal/v2/plugins/video/ -count=1 -timeout 120s -v 2>&1 | tail -30
+          echo ""
+          echo "═══ ComboLite Static Check ═══"
+          go test ./internal/service/ -count=1 -timeout 60s -run TestComboLite -v 2>&1 | tail -20
+          echo ""
+          echo "═══ Go Test Summary ═══"
+          go test ./internal/service/ ./internal/v2/plugins/video/ -count=1 -timeout 120s 2>&1 | tail -5
+
       - name: Build Go binary for Android arm64 (with CGO for ffmpeg dlopen)
         env:
           CGO_ENABLED: "1"
@@ -142,7 +164,7 @@ jobs:
           go build \
             -ldflags="-s -w -X main.version=${{ inputs.version || 'dev' }}" \
             -o app/encv-mobile/encv-go-arm64 \
-            ./cmd/encv
+            ./cmd/encv-mobile
           echo "Go binary size:"
           ls -lh app/encv-mobile/encv-go-arm64
 
@@ -172,10 +194,8 @@ jobs:
             ls -lh "$KEYSTORE"
           fi
 
-      # android/ is in git — cap copy only copies web assets (lighter than cap sync)
-      # For release builds, cap build includes its own sync, so this step is debug-only
-      - name: Copy web assets to Android project (debug)
-        if: inputs.version == ''
+      # android/ is in git — cap copy copies web assets (dist/ → assets/public/). Required for BOTH debug and release because we use gradlew directly instead of npx cap build
+      - name: Copy web assets to Android project
         run: |
           cd app/encv-mobile
           npx cap copy android
@@ -183,6 +203,150 @@ jobs:
           ls -la android/*.gradle android/app/*.gradle
 
       # === Non-Gradle customizations ===
+      - name: Check R8/ProGuard is disabled for ALL build variants
+        run: |
+          set +e  # Don't let sub-command failures kill the script before we print diagnostics
+          exec 2>&1  # Merge stderr into stdout so everything shows in one stream
+
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║     R8 / ProGuard Obfuscation Guard (v2)        ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+
+          VIOLATIONS=0
+          WARNINGS=0
+          FILES_CHECKED=0
+          FILES_SKIPPED=0
+
+          # Phase 1: List ALL .gradle.kts files found
+          echo "📋 Phase 1: Scanning for *.gradle.kts files..."
+          echo "   Search path: app/encv-mobile/android"
+          echo "   Exclude pattern: */build/*"
+          echo ""
+          ALL_FILES=$(find app/encv-mobile/android -name "*.gradle.kts" -not -path "*/build/*" -type f | sort)
+          FILE_COUNT=$(echo "$ALL_FILES" | grep -c .)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::No .gradle.kts files found! Search path may be wrong."
+            echo "   This means the guard cannot check anything."
+            exit 1
+          fi
+
+          echo "   Found $FILE_COUNT file(s):"
+          while IFS= read -r line || [ -n "$line" ]; do
+            echo "     ✦ $line"
+          done < <(echo "$ALL_FILES")
+          echo ""
+
+          # Phase 2: Check each file (use process substitution to avoid subshell variable loss)
+          echo "🔍 Phase 2: Checking each file..."
+          echo ""
+
+          while IFS= read -r f || [ -n "$f" ]; do
+            FILES_CHECKED=$((FILES_CHECKED + 1))
+            BASENAME=$(basename "$f")
+            RELPATH=${f#app/encv-mobile/android/}
+            echo "--- [$FILES_CHECKED/$FILE_COUNT] $RELPATH ---"
+
+            # Check 1: isMinifyEnabled = true → FATAL
+            MINIFY_MATCH=$(grep -n 'isMinifyEnabled\s*=\s*true' "$f" 2>/dev/null)
+            if [ -n "$MINIFY_MATCH" ]; then
+              echo "   ❌ FATAL: isMinifyEnabled = true found:"
+              echo "$MINIFY_MATCH" | while read line; do echo "      $line"; done
+              echo "::error file=$f,line=$(echo "$MINIFY_MATCH" | head -1 | cut -d: -f1)::R8 minification ENABLED (isMinifyEnabled=true) — ComboLite incompatible!"
+              VIOLATIONS=$((VIOLATIONS + 1))
+            else
+              echo "   ✅ isMinifyEnabled ≠ true (OK)"
+            fi
+
+            # Check 2: isShrinkResources = true → FATAL (AGP hard-coupling with minifyEnabled)
+            SHRINK_MATCH=$(grep -n 'isShrinkResources\s*=\s*true' "$f" 2>/dev/null)
+            if [ -n "$SHRINK_MATCH" ]; then
+              echo "   ❌ FATAL: isShrinkResources = true found:"
+              echo "$SHRINK_MATCH" | while read line; do echo "      $line"; done
+              echo "::error file=$f,line=$(echo "$SHRINK_MATCH" | head -1 | cut -d: -f1)::Resource shrinking ENABLED — AGP requires isMinifyEnabled=true (ComboLite incompatible)!"
+              VIOLATIONS=$((VIOLATIONS + 1))
+            else
+              echo "   isShrinkResources ≠ true (not set)"
+            fi
+
+            # Check 3: legacy minifyEnabled = true → FATAL
+            LEGACY_MATCH=$(grep -n 'minifyEnabled\s*=\s*true' "$f" 2>/dev/null)
+            if [ -n "$LEGACY_MATCH" ]; then
+              echo "   ❌ FATAL: Legacy minifyEnabled=true found:"
+              echo "$LEGACY_MATCH" | while read line; do echo "      $line"; done
+              echo "::error file=$f,line=$(echo "$LEGACY_MATCH" | head -1 | cut -d: -f1)::Legacy R8 minification enabled (minifyEnabled=true)"
+              VIOLATIONS=$((VIOLATIONS + 1))
+            else
+              echo "   Legacy minifyEnabled ≠ true (OK)"
+            fi
+
+            # Bonus: Show actual values if buildTypes block exists
+            ACTUAL_MINIFY=$(grep 'isMinifyEnabled' "$f" 2>/dev/null | head -1)
+            ACTUAL_SHRINK=$(grep 'isShrinkResources' "$f" 2>/dev/null | head -1)
+            if [ -n "$ACTUAL_MINIFY" ] || [ -n "$ACTUAL_SHRINK" ]; then
+              echo "   📝 Actual config:"
+              [ -n "$ACTUAL_MINIFY" ] && echo "      $ACTUAL_MINIFY"
+              [ -n "$ACTUAL_SHRINK" ] && echo "      $ACTUAL_SHRINK"
+            fi
+            echo ""
+          done < <(echo "$ALL_FILES")
+
+          # Phase 3: Verdict
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║           GUARD VERDICT                        ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║ Files scanned : $FILE_COUNT                        ║"
+          echo "║ Violations    : $VIOLATIONS (FATAL → blocks build)    ║"
+          echo "║ Warnings      : $WARNINGS (info only)                ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo "::error::❌ GUARD FAILED: $VIOLATIONS R8/ProGuard violation(s) detected."
+            echo ""
+            echo "WHAT THIS MEANS:"
+            echo "  ComboLite framework uses kotlin-reflect (::function.javaMethod)"
+            echo "  for @RequiresPermission permission checks. R8 obfuscation breaks"
+            echo "  @Metadata ↔ bytecode consistency, causing runtime crashes."
+            echo ""
+            echo "HOW TO FIX:"
+            echo "  Set isMinifyEnabled=false AND isShrinkResources=false in ALL buildTypes."
+            echo "  AGP hard-couples these two: shrinkResources requires minifyEnabled=true."
+            echo "  See: .trae/rules/combolite.md §1.3 + .trae/rules/android.md §3.1"
+            echo ""
+
+            # Write detailed report to summary
+            echo "## ❌ R8/ProGuard Guard FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Files scanned | $FILE_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Fatal violations | \`$VIOLATIONS\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Warnings | \`$WARNINGS\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Root cause | R8 breaks kotlin-reflect @Metadata consistency |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Fix:** Set \`isMinifyEnabled=false\`. See [.trae/rules/combolite.md](.trae/rules/combolite.md#13)" >> $GITHUB_STEP_SUMMARY
+
+            exit 1
+          else
+            echo "✅ GUARD PASSED: No R8/ProGuard obfuscation found."
+            if [ "$WARNINGS" -gt 0 ]; then
+              echo "⚠️  $WARNINGS resource shrink warning(s) above (safe with ComboLite)."
+            fi
+            echo ""
+
+            echo "## ✅ R8/ProGuard Guard PASSED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Files scanned | $FILE_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Violations | 0 |" >> $GITHUB_STEP_SUMMARY
+            if [ "$WARNINGS" -gt 0 ]; then
+              echo "| Warnings | $WARNINGS (resource shrink, safe) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
       - name: Copy Go binary to jniLibs
         run: |
           mkdir -p app/encv-mobile/android/app/src/main/jniLibs/arm64-v8a
@@ -251,9 +415,7 @@ jobs:
           if [ -n "$PLUGIN_APK" ] && [ -f "$PLUGIN_APK" ]; then
             echo "✅ Plugin APK generated:"
             ls -lh "$PLUGIN_APK"
-            mkdir -p app/src/main/assets/plugins
-            cp "$PLUGIN_APK" app/src/main/assets/plugins/mpv-player.apk
-            echo "✅ Copied to host assets/plugins/"
+            echo "📁 Plugin will be loaded from disk at runtime (filesDir/plugins/)"
           else
             echo "::error::Plugin APK not found after successful build"
             find build/outputs -name "*.apk" 2>/dev/null | head -5 || echo "No APKs found"
@@ -264,7 +426,8 @@ jobs:
         if: always() && inputs.skip_plugin != true
         continue-on-error: true
         run: |
-          PLUGIN_APK=$(find app/encv-mobile/android/build -name "plugin-mpv-player-debug.apk" -type f 2>/dev/null | head -1)
+          BUILD_TYPE="${{ inputs.version && 'release' || 'debug' }}"
+          PLUGIN_APK=$(find app/encv-mobile/android/build -name "plugin-mpv-player-${BUILD_TYPE}.apk" -type f 2>/dev/null | head -1)
           if [ -f "$PLUGIN_APK" ]; then
             echo "=== Plugin APK size ==="
             ls -lh "$PLUGIN_APK"
@@ -278,33 +441,42 @@ jobs:
 
       # === Build ===
       - name: Build ${{ inputs.version && 'Release' || 'Debug' }} APK
+        env:
+          BUGLY_APP_ID: ${{ secrets.BUGLY_APP_ID }}
         run: |
           cd app/encv-mobile
 
           if [ -n "${{ inputs.version }}" ]; then
             echo "=== Building RELEASE APK v${{ inputs.version }} ==="
-            npx cap build android \
-              --androidreleasetype APK \
-              --keystorepath ${{ github.workspace }}/app/encv-mobile/keystore/release.jks \
-              --keystorepass encv2025 \
-              --keystorealias encvrelease \
-              --keystorealiaspass encv2025
+
+            echo "=== Generating keystore.properties for signing ==="
+            {
+              echo "storeFile=${{ github.workspace }}/app/encv-mobile/keystore/release.jks"
+              echo "storePassword=encv2025"
+              echo "keyAlias=encvrelease"
+              echo "keyPassword=encv2025"
+            } > android/keystore.properties
+            echo "keystore.properties created"
+
+            cd android
+            chmod +x gradlew
+            ./gradlew assembleRelease --stacktrace
 
             echo "=== Locating signed APK ==="
-            ls -la android/app/build/outputs/apk/release/
-            APK_PATH=$(find android/app/build/outputs/apk/release -name "*signed*.apk" -type f | head -1)
-            if [ -z "$APK_PATH" ]; then
-              echo "::warning::Signed APK not found, falling back to any APK"
-              APK_PATH=$(find android/app/build/outputs/apk/release -name "*.apk" -type f | head -1)
-            fi
+            ls -la app/build/outputs/apk/release/
+            APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*-unsigned*" -type f | head -1)
             [ -z "$APK_PATH" ] && { echo "::error::No APK found"; exit 1; }
             echo "Selected APK: $APK_PATH"
 
             echo "Verifying signature..."
             APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" -type f | head -1)
             [ -z "$APKSIGNER" ] && { echo "::error::apksigner not found in $ANDROID_HOME/build-tools"; exit 1; }
-            "$APKSIGNER" verify --print-certs "$APK_PATH"
-            echo "✅ Signed OK: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+            if "$APKSIGNER" verify --print-certs "$APK_PATH"; then
+              echo "✅ Signed OK: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+            else
+              echo "::error::APK signature verification FAILED — signingConfig may not be applied in build.gradle.kts"
+              exit 1
+            fi
           else
             echo "=== Building DEBUG APK ==="
             cd android
@@ -315,8 +487,7 @@ jobs:
       - name: Verify APK contents
         run: |
           if [ -n "${{ inputs.version }}" ]; then
-            APK_PATH=$(find app/encv-mobile/android/app/build/outputs/apk/release -name "*signed*.apk" -type f | head -1)
-            [ -z "$APK_PATH" ] && APK_PATH=$(find app/encv-mobile/android/app/build/outputs/apk/release -name "*.apk" -type f | head -1)
+            APK_PATH=$(find app/encv-mobile/android/app/build/outputs/apk/release -name "*.apk" ! -name "*-unsigned*" -type f | head -1)
           else
             APK_PATH=$(find app/encv-mobile/android/app/build/outputs/apk/debug -name "*.apk" -type f | head -1)
           fi
@@ -325,6 +496,23 @@ jobs:
             ls -lh "$APK_PATH"
             echo "=== Assets ==="
             unzip -l "$APK_PATH" | grep -E "encv-go|config.mobile" || true
+
+            echo "=== Web assets (public/index.html) ==="
+            if unzip -l "$APK_PATH" | grep -q "public/index.html"; then
+              echo "✅ PASS: Web assets found in APK"
+              unzip -l "$APK_PATH" | grep "public/index.html"
+            else
+              echo "::error::Web assets (public/index.html) MISSING from APK! Did npx cap copy android run?"
+              exit 1
+            fi
+
+            echo "=== Config file (config.user.json) ==="
+            if unzip -l "$APK_PATH" | grep -q "config.user.json"; then
+              echo "✅ PASS: config.user.json found in APK"
+            else
+              echo "::warning::config.user.json not in APK assets (will use fallback config on first launch)"
+            fi
+
             echo "=== DEX strings check (real class presence) ==="
             TMPDIR=$(mktemp -d)
             unzip -q "$APK_PATH" -d "$TMPDIR"
@@ -346,14 +534,14 @@ jobs:
             else
               echo "✅ PASS: Host APK excludes MPV .so"
             fi
-            echo "=== Plugin APK in assets ==="
+            echo "=== Plugin loading strategy ==="
             if [ "${{ inputs.skip_plugin }}" = "true" ]; then
               echo "⏭️ Skipped (skip_plugin=true)"
             elif unzip -l "$APK_PATH" | grep -q "mpv-player.apk"; then
-              echo "✅ PASS: Plugin APK found in host assets"
-              unzip -l "$APK_PATH" | grep "mpv-player.apk"
+              echo "❌ FAIL: Plugin APK should NOT be bundled in host assets (disk-based loading)"
+              exit 1
             else
-              echo "::warning::Plugin APK not found in host assets (may be expected for local dev builds)"
+              echo "✅ PASS: Plugin not bundled (loaded from filesDir/plugins/ at runtime)"
             fi
           else
             echo "No APK found to verify"
